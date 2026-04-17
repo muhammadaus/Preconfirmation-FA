@@ -21,10 +21,29 @@ export const viewport: Viewport = {
   viewportFit: "cover",
 };
 
+const miniAppEmbed = JSON.stringify({
+  version: "1",
+  imageUrl: "https://app-fawn-ten-85.vercel.app/image.png",
+  button: {
+    title: "Open App",
+    action: {
+      type: "launch_miniapp",
+      name: "Preconfirmations",
+      url: "https://app-fawn-ten-85.vercel.app",
+      splashImageUrl: "https://app-fawn-ten-85.vercel.app/splash.png",
+      splashBackgroundColor: "#1e40af",
+    },
+  },
+});
+
 export const metadata: Metadata = {
   title: "Preconfirmation",
   description:
     "Safe pending transfers with secret-based confirmation and timeout recovery",
+  other: {
+    "fc:miniapp": miniAppEmbed,
+    "fc:frame": miniAppEmbed,
+  },
 };
 
 export default function RootLayout({
