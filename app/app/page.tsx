@@ -1,12 +1,32 @@
 "use client";
 
 import Link from "next/link";
+import { useEffect } from "react";
 import { useAccount, useConnect, useDisconnect } from "wagmi";
+import { config } from "./lib/wagmi";
+import { useFarcaster } from "./providers";
 
 export default function Home() {
   const { address, isConnected } = useAccount();
   const { connect, connectors } = useConnect();
   const { disconnect } = useDisconnect();
+  const { isLoaded, context } = useFarcaster();
+
+  // Auto-connect when running inside Warpcast
+  useEffect(() => {
+    if (isLoaded && context && !isConnected) {
+      connect({ connector: config.connectors[0] });
+    }
+  }, [isLoaded, context, isConnected, connect]);
+
+  // Show loading while SDK initializes inside Warpcast
+  if (!isLoaded) {
+    return (
+      <main className="flex flex-col items-center justify-center flex-1 p-6">
+        <p className="text-gray-400">Loading...</p>
+      </main>
+    );
+  }
 
   return (
     <main className="flex flex-col items-center justify-center flex-1 p-6 gap-8">
@@ -24,7 +44,7 @@ export default function Home() {
             <button
               key={connector.uid}
               onClick={() => connect({ connector })}
-              className="w-full px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition"
+              className="w-full px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition min-h-[44px]"
             >
               Connect with {connector.name}
             </button>
@@ -36,22 +56,22 @@ export default function Home() {
             {address?.slice(0, 6)}...{address?.slice(-4)}
           </p>
 
-          <div className="flex gap-3">
+          <div className="flex flex-col sm:flex-row gap-3 w-full max-w-sm">
             <Link
               href="/send"
-              className="px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition font-medium"
+              className="flex-1 px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition font-medium text-center min-h-[44px]"
             >
               Send
             </Link>
             <Link
               href="/claim"
-              className="px-6 py-3 bg-green-600 text-white rounded-lg hover:bg-green-700 transition font-medium"
+              className="flex-1 px-6 py-3 bg-green-600 text-white rounded-lg hover:bg-green-700 transition font-medium text-center min-h-[44px]"
             >
               Claim
             </Link>
             <Link
               href="/transfers"
-              className="px-6 py-3 bg-gray-200 text-gray-800 rounded-lg hover:bg-gray-300 transition font-medium"
+              className="flex-1 px-6 py-3 bg-gray-200 text-gray-800 rounded-lg hover:bg-gray-300 transition font-medium text-center min-h-[44px]"
             >
               History
             </Link>
@@ -59,7 +79,7 @@ export default function Home() {
 
           <button
             onClick={() => disconnect()}
-            className="text-sm text-gray-400 hover:text-gray-600 transition"
+            className="text-sm text-gray-400 hover:text-gray-600 transition min-h-[44px]"
           >
             Disconnect
           </button>

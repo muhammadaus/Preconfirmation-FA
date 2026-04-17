@@ -4,6 +4,7 @@ import { Suspense, useState, useEffect, useCallback } from "react";
 import { useSearchParams } from "next/navigation";
 import { useAccount, useWriteContract, useWaitForTransactionReceipt, useReadContract } from "wagmi";
 import { formatEther, type Hex } from "viem";
+import { base } from "viem/chains";
 import {
   PENDING_TRANSFERS_ADDRESS,
   pendingTransfersAbi,
@@ -62,12 +63,13 @@ function ClaimInner() {
     }
   }, []);
 
-  // Read transfer data from chain
+  // Read transfer data from chain — pinned to Base mainnet
   const { data: transfer } = useReadContract({
     address: PENDING_TRANSFERS_ADDRESS,
     abi: pendingTransfersAbi,
     functionName: "getTransfer",
     args: transferId ? [transferId as Hex] : undefined,
+    chainId: base.id,
     query: { enabled: !!transferId },
   });
 
