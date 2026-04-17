@@ -1,0 +1,23 @@
+{
+  "accountAssociation": {
+    "header": "eyJmaWQiOjIzOTgwMywidHlwZSI6ImF1dGgiLCJrZXkiOiIweENGZEVGYjMxZWZiN0NhOERkMTBFNDE4NERiMWM0ZDBjNjM0NzYwOWMifQ",
+    "payload": "eyJkb21haW4iOiJhcHAtZmF3bi10ZW4tODUudmVyY2VsLmFwcCJ9",
+    "signature": "PWo/hMkRm31Ztv2/XmGpqckXOHB8TjwM1Wqrt/KlNJFztECrvtz4LXQ627OX8rkh346VOEMveo4nOWpp7YExrBw="
+  },
+  "frame": {
+    "name": "Preconfirmations",
+    "version": "1",
+    "iconUrl": "https://app-fawn-ten-85.vercel.app/icon.png",
+    "homeUrl": "https://app-fawn-ten-85.vercel.app",
+    "imageUrl": "https://app-fawn-ten-85.vercel.app/image.png",
+    "splashImageUrl": "https://app-fawn-ten-85.vercel.app/splash.png",
+    "splashBackgroundColor": "#1e40af",
+    "webhookUrl": "https://app-fawn-ten-85.vercel.app/api/webhook",
+    "primaryCategory": "finance",
+    "subtitle": "Safer transfers on Base",
+    "description": "Safe pending transfers with secret-based confirmation and timeout recovery on Base. Replaces irreversible push transfers with receiver-bound, hash-committed, cancelable escrow.",
+    "tagline": "Safer transfers on Base",
+    "ogTitle": "Preconfirmations",
+    "ogDescription": "Reversible, cancelable transfers with secret-based confirmation on Base"
+  }
+}
