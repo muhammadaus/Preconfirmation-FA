@@ -2,7 +2,8 @@
 
 import { useState, useCallback } from "react";
 import { useAccount, useWriteContract, useWaitForTransactionReceipt, useReadContract } from "wagmi";
-import { parseEther, type Hex } from "viem";
+import { parseEther, isAddress, type Hex } from "viem";
+import { base } from "viem/chains";
 import { QRCodeSVG } from "qrcode.react";
 import {
   PENDING_TRANSFERS_ADDRESS,
@@ -27,15 +28,21 @@ export default function SendPage() {
   const [result, setResult] = useState<TransferResult | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  // Preview the ID before sending
+  // Validate inputs before attempting contract read
+  const isValidReceiver = isAddress(receiver);
+  const parsedAmount = (() => { try { return amount ? parseEther(amount) : 0n; } catch { return null; } })();
+  const canPreview = !!address && isValidReceiver && !!amount && parsedAmount !== null && parsedAmount > 0n;
+
+  // Preview the ID before sending — pinned to Base mainnet
   const { data: previewId, isLoading: isPreviewLoading, error: previewError } = useReadContract({
     address: PENDING_TRANSFERS_ADDRESS,
     abi: pendingTransfersAbi,
     functionName: "previewId",
-    args: address && receiver
-      ? [address, receiver as Hex, "0x0000000000000000000000000000000000000000" as Hex, parseEther(amount || "0")]
+    args: canPreview
+      ? [address, receiver as Hex, "0x0000000000000000000000000000000000000000" as Hex, parsedAmount!]
       : undefined,
-    query: { enabled: !!address && !!receiver && !!amount },
+    chainId: base.id,
+    query: { enabled: canPreview },
   });
 
   const { writeContract, data: txHash, isPending: isSigning } = useWriteContract();
@@ -47,10 +54,13 @@ export default function SendPage() {
     setError(null);
     if (!address) { setError("Wallet not connected"); return; }
     if (!receiver) { setError("Enter a receiver address"); return; }
+    if (!isValidReceiver) { setError("Invalid receiver address"); return; }
     if (!amount) { setError("Enter an amount"); return; }
+    if (parsedAmount === null) { setError("Invalid amount format"); return; }
+    if (parsedAmount === 0n) { setError("Amount must be greater than 0"); return; }
     if (isPreviewLoading) { setError("Loading transfer ID, try again in a moment..."); return; }
     if (previewError) { setError(`Contract read failed: ${previewError.message}`); return; }
-    if (!previewId) { setError("Could not compute transfer ID — check receiver address and amount"); return; }
+    if (!previewId) { setError("Could not compute transfer ID — try again"); return; }
 
     try {
       const secret = generateSecret();
@@ -78,7 +88,7 @@ export default function SendPage() {
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : "Unknown error");
     }
-  }, [address, receiver, amount, previewId, previewError, isPreviewLoading, expiryMinutes, writeContract]);
+  }, [address, receiver, isValidReceiver, amount, parsedAmount, previewId, previewError, isPreviewLoading, expiryMinutes, writeContract]);
 
   if (!isConnected) {
     return (
