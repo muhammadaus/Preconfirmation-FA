@@ -153,29 +153,29 @@ function ClaimInner() {
 
         {/* Transfer details */}
         {transfer && status !== undefined && (
-          <div className="bg-gray-50 rounded-xl p-4 space-y-2">
+          <div className="bg-gray-900 text-gray-100 rounded-xl p-4 space-y-2">
             <div className="flex justify-between text-sm">
-              <span className="text-gray-500">Status</span>
-              <span className={isPending ? "text-yellow-600 font-medium" : "text-gray-700"}>
+              <span className="text-gray-400">Status</span>
+              <span className={isPending ? "text-yellow-400 font-medium" : "text-gray-200"}>
                 {STATUS_LABELS[status] ?? "Unknown"}
               </span>
             </div>
             {amount !== undefined && (
               <div className="flex justify-between text-sm">
-                <span className="text-gray-500">Amount</span>
-                <span className="font-mono">{formatEther(amount)} ETH</span>
+                <span className="text-gray-400">Amount</span>
+                <span className="font-mono text-white">{formatEther(amount)} ETH</span>
               </div>
             )}
             {sender && (
               <div className="flex justify-between text-sm">
-                <span className="text-gray-500">From</span>
-                <span className="font-mono text-xs">{sender.slice(0, 6)}...{sender.slice(-4)}</span>
+                <span className="text-gray-400">From</span>
+                <span className="font-mono text-xs text-gray-200">{sender.slice(0, 6)}...{sender.slice(-4)}</span>
               </div>
             )}
             {expiry && (
               <div className="flex justify-between text-sm">
-                <span className="text-gray-500">Expires</span>
-                <span className={isExpired ? "text-red-500" : ""}>
+                <span className="text-gray-400">Expires</span>
+                <span className={isExpired ? "text-red-400" : "text-gray-200"}>
                   {new Date(expiry * 1000).toLocaleString()}
                   {isExpired && " (expired)"}
                 </span>

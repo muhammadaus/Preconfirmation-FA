@@ -21,7 +21,7 @@ export const viewport: Viewport = {
   viewportFit: "cover",
 };
 
-const miniAppEmbed = JSON.stringify({
+const embedBase = {
   version: "1",
   imageUrl: "https://app-fawn-ten-85.vercel.app/image.png",
   button: {
@@ -34,15 +34,23 @@ const miniAppEmbed = JSON.stringify({
       splashBackgroundColor: "#1e40af",
     },
   },
-});
+};
+
+const frameEmbed = {
+  ...embedBase,
+  button: {
+    ...embedBase.button,
+    action: { ...embedBase.button.action, type: "launch_frame" },
+  },
+};
 
 export const metadata: Metadata = {
   title: "Preconfirmation",
   description:
     "Safe pending transfers with secret-based confirmation and timeout recovery",
   other: {
-    "fc:miniapp": miniAppEmbed,
-    "fc:frame": miniAppEmbed,
+    "fc:miniapp": JSON.stringify(embedBase),
+    "fc:frame": JSON.stringify(frameEmbed),
   },
 };
 

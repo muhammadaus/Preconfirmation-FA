@@ -110,24 +110,26 @@ export default function SendPage() {
           Share this code with the receiver. They need it to claim the funds.
         </p>
 
-        <div className="bg-gray-50 rounded-xl p-6 w-full space-y-4">
+        <div className="bg-gray-900 text-gray-100 rounded-xl p-6 w-full space-y-4">
           <div>
             <label className="text-xs text-gray-400 uppercase tracking-wide">Short Code</label>
-            <p className="font-mono text-lg tracking-wider select-all">{result.shortCode}</p>
+            <p className="font-mono text-lg tracking-wider select-all text-white">{result.shortCode}</p>
           </div>
 
           <div>
             <label className="text-xs text-gray-400 uppercase tracking-wide">Transfer ID</label>
-            <p className="font-mono text-xs break-all select-all">{result.id}</p>
+            <p className="font-mono text-xs break-all select-all text-gray-200">{result.id}</p>
           </div>
 
           <div className="flex justify-center">
-            <QRCodeSVG value={result.claimUrl} size={200} />
+            <div className="bg-white p-3 rounded-lg">
+              <QRCodeSVG value={result.claimUrl} size={200} />
+            </div>
           </div>
 
           <div>
             <label className="text-xs text-gray-400 uppercase tracking-wide">Claim Link</label>
-            <p className="font-mono text-xs break-all select-all">{result.claimUrl}</p>
+            <p className="font-mono text-xs break-all select-all text-gray-200">{result.claimUrl}</p>
           </div>
         </div>
 
