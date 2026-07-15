@@ -37,6 +37,7 @@ interface IERC20TwoPhase {
         uint256 amount;
         uint64 expiry; // unix seconds
         Status status;
+        address commit; // address of the secret key; address(0) => plain (no-secret) mode
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -44,8 +45,15 @@ interface IERC20TwoPhase {
     //////////////////////////////////////////////////////////////*/
 
     /// @notice Emitted when a sender escrows `amount` into pending state.
+    /// @dev `commit` is address(0) for plain-mode transfers; non-zero for committed
+    ///      ones. A single event for both modes keeps indexers simple.
     event TransferInitiated(
-        uint256 indexed id, address indexed from, address indexed to, uint256 amount, uint64 expiry
+        uint256 indexed id,
+        address indexed from,
+        address indexed to,
+        uint256 amount,
+        uint64 expiry,
+        address commit
     );
 
     /// @notice Emitted when the bound receiver accepts. A standard ERC-20 `Transfer`
@@ -69,6 +77,9 @@ interface IERC20TwoPhase {
     error NotSender(); // revoke / reclaim by non-sender
     error NotPending(); // transfer is not in Pending state
     error NotExpired(); // reclaim before expiry
+    error BadCommit(); // commit == address(0) on initiateTransferWithCommit (client bug)
+    error SecretRequired(); // plain accept on a committed transfer
+    error BadSecret(); // signature doesn't recover to the committed secret address
 
     /*//////////////////////////////////////////////////////////////
                                FUNCTIONS
@@ -81,8 +92,33 @@ interface IERC20TwoPhase {
         external
         returns (uint256 id);
 
-    /// @notice Bound receiver accepts, crediting their balance. Receiver-only.
+    /// @notice Like `initiateTransfer`, but additionally binds a secret-key commitment.
+    ///         The "secret" delivered out-of-band is a throwaway PRIVATE KEY; `commit`
+    ///         is its address. Settlement then requires BOTH the receiver's account
+    ///         key (`msg.sender == to`) AND a signature by the secret key over
+    ///         `keccak256(abi.encode(block.chainid, token, id, msg.sender))`.
+    /// @dev The secret key itself NEVER appears on-chain — not in calldata, not on
+    ///      revert. A mistaken submission from the wrong account leaks only a
+    ///      signature bound to that wrong account's address, which is unusable by
+    ///      anyone else (and still unusable from that account: NotReceiver). If `to`
+    ///      turns out to be unowned / mistyped, the only correct actions are
+    ///      `revokeTransfer` or `reclaimExpired`.
+    /// @param commit Address derived from the secret key; MUST NOT be address(0).
+    function initiateTransferWithCommit(address to, uint256 amount, uint64 expiry, address commit)
+        external
+        returns (uint256 id);
+
+    /// @notice Bound receiver accepts a plain (no-commit) transfer. Receiver-only.
+    /// @dev MUST revert with `SecretRequired` if the transfer carries a commit.
     function acceptTransfer(uint256 id) external;
+
+    /// @notice Bound receiver accepts a committed transfer by proving knowledge of
+    ///         the secret key: `secretSig` is that key's ECDSA signature over
+    ///         `keccak256(abi.encode(block.chainid, address(this), id, msg.sender))`.
+    /// @dev Receiver check MUST run before the signature check. Because the signed
+    ///      digest includes chainid, token, id, AND msg.sender, an observed signature
+    ///      cannot be replayed by any other caller, on any other transfer or chain.
+    function acceptTransfer(uint256 id, bytes calldata secretSig) external;
 
     /// @notice Sender revokes a still-pending transfer, refunding themselves. Sender-only.
     function revokeTransfer(uint256 id) external;

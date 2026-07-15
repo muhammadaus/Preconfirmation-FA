@@ -178,6 +178,107 @@ contract ERC721TwoPhaseTest is Test {
         assertEq(nft.ownerOf(TOK), bob, "plain transfer instant when unlocked");
     }
 
+    /*──────────────────────── committed (secret) mode ────────*/
+
+    /// @dev The "secret" is a throwaway PRIVATE KEY delivered out-of-band; only its
+    ///      address is committed on-chain (see ERC20 suite for full rationale).
+    uint256 internal constant SECRET_KEY = uint256(keccak256("out-of-band secret key"));
+
+    function _commit() internal pure returns (address) {
+        return vm.addr(SECRET_KEY);
+    }
+
+    function _secretSig(uint256 id, address caller) internal view returns (bytes memory) {
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(SECRET_KEY, nft.acceptDigest(id, caller));
+        return abi.encodePacked(r, s, v);
+    }
+
+    function _initiateCommitted() internal returns (uint256 id) {
+        vm.prank(alice);
+        id = nft.initiateTransferWithCommit(bob, TOK, expiry, _commit());
+    }
+
+    function test_committed_acceptWithSecretSig_movesOwnership() public {
+        uint256 id = _initiateCommitted();
+        assertEq(nft.pendingTransfer(id).commit, _commit(), "commit stored");
+
+        // Sig computed first: _secretSig makes an external view call (acceptDigest),
+        // which would otherwise consume the prank meant for acceptTransfer.
+        bytes memory sig = _secretSig(id, bob);
+        vm.prank(bob);
+        nft.acceptTransfer(id, sig);
+
+        assertEq(nft.ownerOf(TOK), bob, "ownership moved");
+        assertFalse(nft.isLocked(TOK), "unlocked after accept");
+    }
+
+    /// @dev A signature observed in the mempool is unusable by any other caller.
+    function test_committed_revert_replayedSigWrongCaller() public {
+        uint256 id = _initiateCommitted();
+        bytes memory bobsSig = _secretSig(id, bob);
+
+        vm.prank(eve);
+        vm.expectRevert(IERC721TwoPhase.NotReceiver.selector);
+        nft.acceptTransfer(id, bobsSig);
+    }
+
+    /// @dev Mistaken submission from the wrong account leaks only a signature bound
+    ///      to that account — unusable even by the bound receiver; key stays private.
+    function test_committed_revert_sigBoundToWrongAccount() public {
+        uint256 id = _initiateCommitted();
+        bytes memory sigForEve = _secretSig(id, eve);
+
+        vm.prank(bob);
+        vm.expectRevert(IERC721TwoPhase.BadSecret.selector);
+        nft.acceptTransfer(id, sigForEve);
+    }
+
+    function test_committed_revert_wrongKeySig() public {
+        uint256 id = _initiateCommitted();
+        (uint8 v, bytes32 r, bytes32 s) =
+            vm.sign(uint256(keccak256("wrong key")), nft.acceptDigest(id, bob));
+
+        vm.prank(bob);
+        vm.expectRevert(IERC721TwoPhase.BadSecret.selector);
+        nft.acceptTransfer(id, abi.encodePacked(r, s, v));
+    }
+
+    function test_committed_revert_plainAccept() public {
+        uint256 id = _initiateCommitted();
+        vm.prank(bob);
+        vm.expectRevert(IERC721TwoPhase.SecretRequired.selector);
+        nft.acceptTransfer(id);
+    }
+
+    function test_committed_revert_zeroCommit() public {
+        vm.prank(alice);
+        vm.expectRevert(IERC721TwoPhase.BadCommit.selector);
+        nft.initiateTransferWithCommit(bob, TOK, expiry, address(0));
+    }
+
+    function test_plain_revert_sigAccept() public {
+        uint256 id = _initiate();
+        bytes memory sig = _secretSig(id, bob);
+        vm.prank(bob);
+        vm.expectRevert(IERC721TwoPhase.BadSecret.selector);
+        nft.acceptTransfer(id, sig);
+    }
+
+    function test_committed_revoke_needsNoSecret() public {
+        uint256 id = _initiateCommitted();
+        vm.prank(alice);
+        nft.revokeTransfer(id);
+        assertEq(nft.ownerOf(TOK), alice, "owner unchanged, no secret needed");
+        assertFalse(nft.isLocked(TOK));
+    }
+
+    function test_committed_lockStillEnforced() public {
+        _initiateCommitted();
+        vm.prank(alice);
+        vm.expectRevert(IERC721TwoPhase.TokenLocked.selector);
+        nft.transferFrom(alice, eve, TOK);
+    }
+
     /*──────────────────────── ERC-165 ────────────────────────*/
 
     function test_supportsInterface() public view {

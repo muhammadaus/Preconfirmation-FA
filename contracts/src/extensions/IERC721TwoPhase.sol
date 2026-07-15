@@ -33,14 +33,21 @@ interface IERC721TwoPhase {
         uint256 tokenId;
         uint64 expiry; // unix seconds
         Status status;
+        address commit; // address of the secret key; address(0) => plain (no-secret) mode
     }
 
     /*//////////////////////////////////////////////////////////////
                                 EVENTS
     //////////////////////////////////////////////////////////////*/
 
+    /// @dev `commit` is address(0) for plain-mode transfers; non-zero for committed ones.
     event TransferInitiated(
-        uint256 indexed id, address indexed from, address indexed to, uint256 tokenId, uint64 expiry
+        uint256 indexed id,
+        address indexed from,
+        address indexed to,
+        uint256 tokenId,
+        uint64 expiry,
+        address commit
     );
 
     /// @notice Emitted when the receiver accepts. A standard ERC-721 `Transfer`
@@ -64,6 +71,9 @@ interface IERC721TwoPhase {
     error NotExpired(); // reclaim before expiry
     error AlreadyPending(); // tokenId already has a pending transfer
     error TokenLocked(); // plain transfer attempted on a pending tokenId
+    error BadCommit(); // commit == address(0) on initiateTransferWithCommit (client bug)
+    error SecretRequired(); // plain accept on a committed transfer
+    error BadSecret(); // signature doesn't recover to the committed secret address
 
     /*//////////////////////////////////////////////////////////////
                                FUNCTIONS
@@ -77,8 +87,31 @@ interface IERC721TwoPhase {
         external
         returns (uint256 id);
 
-    /// @notice Bound receiver accepts, moving ownership. Receiver-only.
+    /// @notice Like `initiateTransfer`, but additionally binds a secret-key commitment.
+    ///         The "secret" delivered out-of-band is a throwaway PRIVATE KEY; `commit`
+    ///         is its address. Settlement then requires BOTH the receiver's account
+    ///         key AND a signature by the secret key (see `acceptTransfer(id, sig)`).
+    /// @dev The secret key itself NEVER appears on-chain — not in calldata, not on
+    ///      revert. A mistaken submission from the wrong account leaks only a
+    ///      signature bound to that account, unusable by anyone else. If `to` is
+    ///      unowned or mistyped, the only correct actions are `revokeTransfer` or
+    ///      `reclaimExpired`.
+    /// @param commit Address derived from the secret key; MUST NOT be address(0).
+    function initiateTransferWithCommit(address to, uint256 tokenId, uint64 expiry, address commit)
+        external
+        returns (uint256 id);
+
+    /// @notice Bound receiver accepts a plain (no-commit) transfer. Receiver-only.
+    /// @dev MUST revert with `SecretRequired` if the transfer carries a commit.
     function acceptTransfer(uint256 id) external;
+
+    /// @notice Bound receiver accepts a committed transfer by proving knowledge of
+    ///         the secret key: `secretSig` is that key's ECDSA signature over
+    ///         `keccak256(abi.encode(block.chainid, address(this), id, msg.sender))`.
+    /// @dev Receiver check MUST run before the signature check. The signed digest
+    ///      includes chainid, token, id, and msg.sender, so an observed signature
+    ///      cannot be replayed by any other caller, transfer, or chain.
+    function acceptTransfer(uint256 id, bytes calldata secretSig) external;
 
     /// @notice Sender revokes a still-pending transfer, unlocking the token. Sender-only.
     function revokeTransfer(uint256 id) external;

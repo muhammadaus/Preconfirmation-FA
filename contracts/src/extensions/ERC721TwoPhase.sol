@@ -2,6 +2,7 @@
 pragma solidity 0.8.24;
 
 import { ERC721 } from "@openzeppelin/contracts/token/ERC721/ERC721.sol";
+import { ECDSA } from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import { IERC721TwoPhase } from "./IERC721TwoPhase.sol";
 
 /// @title ERC721TwoPhase — abstract opt-in two-phase transfer extension over OZ ERC721.
@@ -51,6 +52,25 @@ abstract contract ERC721TwoPhase is ERC721, IERC721TwoPhase {
         virtual
         returns (uint256 id)
     {
+        return _initiate(to, tokenId, expiry, address(0));
+    }
+
+    /// @inheritdoc IERC721TwoPhase
+    function initiateTransferWithCommit(address to, uint256 tokenId, uint64 expiry, address commit)
+        external
+        virtual
+        returns (uint256 id)
+    {
+        if (commit == address(0)) revert BadCommit();
+        return _initiate(to, tokenId, expiry, commit);
+    }
+
+    /// @dev Shared initiate path. `commit == address(0)` means plain mode; non-zero
+    ///      means committed mode (receiver key AND a signature by the secret key).
+    function _initiate(address to, uint256 tokenId, uint64 expiry, address commit)
+        private
+        returns (uint256 id)
+    {
         if (to == address(0) || to == msg.sender) revert BadReceiver();
         if (expiry < block.timestamp + MIN_EXPIRY) revert BadExpiry();
         if (expiry > block.timestamp + MAX_EXPIRY) revert BadExpiry();
@@ -64,11 +84,16 @@ abstract contract ERC721TwoPhase is ERC721, IERC721TwoPhase {
         id = ++_nextId;
 
         _pending[id] = PendingTransfer({
-            from: owner, to: to, tokenId: tokenId, expiry: expiry, status: Status.Pending
+            from: owner,
+            to: to,
+            tokenId: tokenId,
+            expiry: expiry,
+            status: Status.Pending,
+            commit: commit
         });
         _lockOf[tokenId] = id; // lock: any _update now reverts until settled
 
-        emit TransferInitiated(id, owner, to, tokenId, expiry);
+        emit TransferInitiated(id, owner, to, tokenId, expiry, commit);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -80,7 +105,40 @@ abstract contract ERC721TwoPhase is ERC721, IERC721TwoPhase {
         PendingTransfer storage t = _pending[id];
         if (t.status != Status.Pending) revert NotPending();
         if (msg.sender != t.to) revert NotReceiver();
+        if (t.commit != address(0)) revert SecretRequired();
 
+        _settle(id, t);
+    }
+
+    /// @inheritdoc IERC721TwoPhase
+    /// @dev The secret key never touches the chain: the receiver proves knowledge by
+    ///      signing a digest binding chainid, this contract, the transfer id, AND the
+    ///      caller. A mistaken submission from the wrong account leaks only a
+    ///      signature over that wrong address — non-replayable by anyone. Receiver
+    ///      check still runs BEFORE the signature check.
+    function acceptTransfer(uint256 id, bytes calldata secretSig) external virtual {
+        PendingTransfer storage t = _pending[id];
+        if (t.status != Status.Pending) revert NotPending();
+        if (msg.sender != t.to) revert NotReceiver();
+
+        (address recovered,,) = ECDSA.tryRecover(_acceptDigest(id, msg.sender), secretSig);
+        if (t.commit == address(0) || recovered != t.commit) revert BadSecret();
+
+        _settle(id, t);
+    }
+
+    /// @dev Digest the secret key must sign for `caller` to accept transfer `id`.
+    function _acceptDigest(uint256 id, address caller) internal view returns (bytes32) {
+        return keccak256(abi.encode(block.chainid, address(this), id, caller));
+    }
+
+    /// @notice Public helper for clients: the digest to sign with the secret key.
+    function acceptDigest(uint256 id, address caller) external view returns (bytes32) {
+        return _acceptDigest(id, caller);
+    }
+
+    /// @dev Shared settlement: unlock, then move ownership through the guarded _update.
+    function _settle(uint256 id, PendingTransfer storage t) private {
         t.status = Status.Accepted;
 
         uint256 tokenId = t.tokenId;

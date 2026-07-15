@@ -184,6 +184,124 @@ contract ERC20TwoPhaseTest is Test {
         assertFalse(token.supportsInterface(0xffffffff));
     }
 
+    /*──────────────────────── committed (secret) mode ────────*/
+
+    /// @dev The "secret" is a throwaway PRIVATE KEY delivered out-of-band; only its
+    ///      address is committed on-chain. Accepting requires a signature by this key
+    ///      over acceptDigest(id, msg.sender) — the key itself never hits calldata.
+    uint256 internal constant SECRET_KEY = uint256(keccak256("out-of-band secret key"));
+
+    function _commit() internal pure returns (address) {
+        return vm.addr(SECRET_KEY);
+    }
+
+    /// @dev Signature the secret key produces for `caller` accepting `id`.
+    function _secretSig(uint256 id, address caller) internal view returns (bytes memory) {
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(SECRET_KEY, token.acceptDigest(id, caller));
+        return abi.encodePacked(r, s, v);
+    }
+
+    function _initiateCommitted(uint256 amount) internal returns (uint256 id) {
+        vm.prank(alice);
+        id = token.initiateTransferWithCommit(bob, amount, expiry, _commit());
+    }
+
+    function test_committed_acceptWithSecretSig_credits() public {
+        uint256 amt = 100 ether;
+        uint256 id = _initiateCommitted(amt);
+        assertEq(token.pendingTransfer(id).commit, _commit(), "commit stored");
+
+        // Sig computed first: _secretSig makes an external view call (acceptDigest),
+        // which would otherwise consume the prank meant for acceptTransfer.
+        bytes memory sig = _secretSig(id, bob);
+        vm.prank(bob);
+        token.acceptTransfer(id, sig);
+
+        assertEq(token.balanceOf(bob), amt, "receiver credited");
+        assertEq(uint8(token.pendingTransfer(id).status), uint8(IERC20TwoPhase.Status.Accepted));
+    }
+
+    /// @dev A signature observed in the mempool (or leaked by a mistaken submission)
+    ///      is unusable by any other caller: Eve replays Bob's valid signature.
+    function test_committed_revert_replayedSigWrongCaller() public {
+        uint256 id = _initiateCommitted(100 ether);
+        bytes memory bobsSig = _secretSig(id, bob);
+
+        vm.prank(eve);
+        vm.expectRevert(IERC20TwoPhase.NotReceiver.selector);
+        token.acceptTransfer(id, bobsSig);
+    }
+
+    /// @dev The mistaken-submission scenario the raw-preimage design failed: the
+    ///      receiver signs for the WRONG account (fat-fingered wallet). That leaked
+    ///      calldata contains only a signature over the wrong address — even the
+    ///      bound receiver cannot use it, and the secret key remains private.
+    function test_committed_revert_sigBoundToWrongAccount() public {
+        uint256 id = _initiateCommitted(100 ether);
+        bytes memory sigForEve = _secretSig(id, eve); // digest binds eve, not bob
+
+        vm.prank(bob);
+        vm.expectRevert(IERC20TwoPhase.BadSecret.selector);
+        token.acceptTransfer(id, sigForEve);
+    }
+
+    function test_committed_revert_wrongKeySig() public {
+        uint256 id = _initiateCommitted(100 ether);
+        uint256 wrongKey = uint256(keccak256("wrong key"));
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(wrongKey, token.acceptDigest(id, bob));
+
+        vm.prank(bob);
+        vm.expectRevert(IERC20TwoPhase.BadSecret.selector);
+        token.acceptTransfer(id, abi.encodePacked(r, s, v));
+    }
+
+    function test_committed_revert_garbageSig() public {
+        uint256 id = _initiateCommitted(100 ether);
+        vm.prank(bob);
+        vm.expectRevert(IERC20TwoPhase.BadSecret.selector);
+        token.acceptTransfer(id, hex"deadbeef");
+    }
+
+    function test_committed_revert_plainAccept() public {
+        uint256 id = _initiateCommitted(100 ether);
+        vm.prank(bob);
+        vm.expectRevert(IERC20TwoPhase.SecretRequired.selector);
+        token.acceptTransfer(id);
+    }
+
+    function test_committed_revert_zeroCommit() public {
+        vm.prank(alice);
+        vm.expectRevert(IERC20TwoPhase.BadCommit.selector);
+        token.initiateTransferWithCommit(bob, 1 ether, expiry, address(0));
+    }
+
+    function test_plain_revert_sigAccept() public {
+        uint256 id = _initiate(100 ether);
+        bytes memory sig = _secretSig(id, bob);
+        vm.prank(bob);
+        vm.expectRevert(IERC20TwoPhase.BadSecret.selector);
+        token.acceptTransfer(id, sig);
+    }
+
+    function test_committed_revoke_needsNoSecret() public {
+        uint256 before = token.balanceOf(alice);
+        uint256 id = _initiateCommitted(100 ether);
+
+        vm.prank(alice);
+        token.revokeTransfer(id);
+        assertEq(token.balanceOf(alice), before, "sender refunded without secret");
+    }
+
+    function test_committed_reclaim_needsNoSecret() public {
+        uint256 before = token.balanceOf(alice);
+        uint256 id = _initiateCommitted(100 ether);
+
+        vm.warp(expiry + 1);
+        vm.prank(alice);
+        token.reclaimExpired(id);
+        assertEq(token.balanceOf(alice), before, "sender reclaimed without secret");
+    }
+
     /*──────────────────────── invariant / fuzz ───────────────*/
 
     /// @dev totalSupply == sum(balances) + sum(pending). Because pending funds are

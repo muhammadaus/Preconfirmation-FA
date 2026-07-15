@@ -3,6 +3,7 @@ pragma solidity 0.8.24;
 
 import { ERC20 } from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import { IERC165 } from "@openzeppelin/contracts/utils/introspection/IERC165.sol";
+import { ECDSA } from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import { IERC20TwoPhase } from "./IERC20TwoPhase.sol";
 
 /// @title ERC20TwoPhase — abstract opt-in two-phase transfer extension over OZ ERC20.
@@ -57,6 +58,26 @@ abstract contract ERC20TwoPhase is ERC20, IERC20TwoPhase {
         virtual
         returns (uint256 id)
     {
+        return _initiate(to, amount, expiry, address(0));
+    }
+
+    /// @inheritdoc IERC20TwoPhase
+    function initiateTransferWithCommit(address to, uint256 amount, uint64 expiry, address commit)
+        external
+        virtual
+        returns (uint256 id)
+    {
+        if (commit == address(0)) revert BadCommit();
+        return _initiate(to, amount, expiry, commit);
+    }
+
+    /// @dev Shared initiate path. `commit == address(0)` means plain mode (accept
+    ///      needs only the receiver key); non-zero means committed mode (receiver key
+    ///      AND a signature by the secret key).
+    function _initiate(address to, uint256 amount, uint64 expiry, address commit)
+        private
+        returns (uint256 id)
+    {
         if (amount == 0) revert BadAmount();
         if (to == address(0) || to == msg.sender) revert BadReceiver();
         if (expiry < block.timestamp + MIN_EXPIRY) revert BadExpiry();
@@ -66,7 +87,12 @@ abstract contract ERC20TwoPhase is ERC20, IERC20TwoPhase {
 
         // Effects: record pending state before moving funds.
         _pending[id] = PendingTransfer({
-            from: msg.sender, to: to, amount: amount, expiry: expiry, status: Status.Pending
+            from: msg.sender,
+            to: to,
+            amount: amount,
+            expiry: expiry,
+            status: Status.Pending,
+            commit: commit
         });
 
         // Escrow: sender balance -> token contract balance. Reverts on insufficient
@@ -74,7 +100,7 @@ abstract contract ERC20TwoPhase is ERC20, IERC20TwoPhase {
         // internal accounting (no external call), so CEI is respected.
         _transfer(msg.sender, address(this), amount);
 
-        emit TransferInitiated(id, msg.sender, to, amount, expiry);
+        emit TransferInitiated(id, msg.sender, to, amount, expiry, commit);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -86,10 +112,49 @@ abstract contract ERC20TwoPhase is ERC20, IERC20TwoPhase {
         PendingTransfer storage t = _pending[id];
         if (t.status != Status.Pending) revert NotPending();
         if (msg.sender != t.to) revert NotReceiver();
+        if (t.commit != address(0)) revert SecretRequired();
 
+        _settle(id, t);
+    }
+
+    /// @inheritdoc IERC20TwoPhase
+    /// @dev The secret key never touches the chain: the receiver proves knowledge by
+    ///      signing a digest that binds chainid, this token, the transfer id, AND the
+    ///      caller. Consequences:
+    ///        - A mistaken submission from the wrong account leaks only a signature
+    ///          over that wrong address — worthless to everyone, including the
+    ///          submitter (NotReceiver), and non-replayable by others (digest binds
+    ///          msg.sender).
+    ///        - Mempool observation of a valid accept reveals nothing reusable.
+    ///      Receiver check still runs BEFORE the signature check, so a non-receiver
+    ///      learns nothing about signature validity.
+    function acceptTransfer(uint256 id, bytes calldata secretSig) external virtual {
+        PendingTransfer storage t = _pending[id];
+        if (t.status != Status.Pending) revert NotPending();
+        if (msg.sender != t.to) revert NotReceiver();
+
+        (address recovered,,) = ECDSA.tryRecover(_acceptDigest(id, msg.sender), secretSig);
+        if (t.commit == address(0) || recovered != t.commit) revert BadSecret();
+
+        _settle(id, t);
+    }
+
+    /// @notice Digest the secret key must sign for `caller` to accept transfer `id`.
+    /// @dev Exposed so clients can build the exact preimage without replicating the
+    ///      encoding. Layout: abi.encode(block.chainid, address(this), id, caller).
+    function _acceptDigest(uint256 id, address caller) internal view returns (bytes32) {
+        return keccak256(abi.encode(block.chainid, address(this), id, caller));
+    }
+
+    /// @notice Public helper for clients: the digest to sign with the secret key.
+    function acceptDigest(uint256 id, address caller) external view returns (bytes32) {
+        return _acceptDigest(id, caller);
+    }
+
+    /// @dev Shared settlement: escrow -> receiver, standard ERC-20 Transfer event.
+    function _settle(uint256 id, PendingTransfer storage t) private {
         t.status = Status.Accepted;
 
-        // Settle: escrow -> receiver. Emits the standard ERC-20 Transfer event.
         _transfer(address(this), t.to, t.amount);
 
         emit TransferAccepted(id);

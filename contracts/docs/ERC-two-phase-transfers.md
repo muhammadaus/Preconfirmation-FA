@@ -1,525 +1,681 @@
-# ERC-XXXX: Two-Phase Token Transfers
-
-> **Status:** Draft  
-> **Category:** ERC  
-> **Requires:** ERC-20, ERC-721, ERC-165  
-> **Created:** 2026-07-04  
-> **Authors:** Preconfirmation-FA contributors  
-
+---
+eip: TBD
+title: Two-Phase Asset Transfers
+description: Revocable transfers of ETH and tokens that settle only when the named receiver accepts, optionally gated by an off-chain secret key.
+author: muhammadaus <muhammad.aus@cipherlogic.xyz>
+discussions-to: https://ethereum-magicians.org/t/two-phase-asset-transfers/TBD
+status: Draft
+type: Standards Track
+category: ERC
+created: 2026-07-12
+requires: 20, 165, 721, 1155
 ---
 
 ## Abstract
 
-This document specifies an **opt-in extension** to ERC-20 and ERC-721 that replaces atomic
-push-to-address settlement with a two-step lifecycle: *initiate* (sender locks funds) →
-*accept* (receiver confirms) → settle. Unaccepted transfers are reclaimable by the sender
-at any time while pending; they expire automatically if not accepted within a bounded window.
-Plain `transfer()` / `transferFrom()` semantics are **preserved unchanged** so that existing
-DeFi integrations are not broken.
+This ERC specifies a **two-phase transfer** for any on-chain asset: the sender *initiates* (the
+asset is locked, bound to a named receiver), the receiver *accepts*, and only then does the
+transfer settle. Until someone accepts, the sender can take the asset back at any time; after a
+deadline passes, the sender can reclaim it.
 
-The extension introduces two interfaces, `IERC20TwoPhase` and `IERC721TwoPhase`, both
-discoverable via ERC-165, enabling wallets and dapps to surface pending-inbound UX uniformly
-across compliant tokens.
+The lifecycle is specified in two conforming embodiments:
 
----
+- **Standalone escrow (`ITwoPhaseEscrow`)**: a deployable contract that retrofits two-phase
+  settlement onto assets that cannot be modified: **native ETH** and **any already-deployed
+  [ERC-20](./erc-20.md), [ERC-721](./erc-721.md), or [ERC-1155](./erc-1155.md)**.
+- **Token-native extensions (`IERC20TwoPhase`, `IERC721TwoPhase`)**: opt-in interfaces for
+  newly deployed tokens that build the lifecycle into the token itself, with no external
+  contract or approval step.
+
+Two acceptance modes are specified:
+
+1. **Plain mode**: accepting takes only a transaction signed by the named receiver.
+2. **Committed mode (optional)**: the sender also creates a throwaway secret key and hands it
+   to the receiver off-chain. Accepting then takes the receiver's own key **and** a signature
+   made with the secret key. The secret never appears on-chain, not in successful transactions
+   and not in reverted ones, and neither factor works without the other.
+
+Plain `transfer()` / `transferFrom()` / `safeTransferFrom()` semantics are **preserved unchanged**
+so existing DeFi and marketplace integrations are not broken. The token-native interfaces are
+discoverable via [ERC-165](./erc-165.md).
 
 ## Motivation
 
-EVM token transfers are irrevocable by design. Once `transfer(to, amount)` executes, the
-recipient owns the funds; the sender has no recourse. In practice this creates a well-documented
-loss class: addresses mistyped by one character, clipboard poisoning, QR-code substitution, or
-simply sending to a contact who is no longer reachable at that address. Blockchain analytics
-firms (Chainalysis, Elliptic) have reported hundreds of millions of dollars permanently locked
-in unreachable addresses annually.
+On Ethereum, a transfer cannot be undone. Send ETH or tokens to the wrong address (one
+mistyped character, a poisoned clipboard, a swapped QR code, a contact who lost that key) and
+the assets are gone. Analytics firms report hundreds of millions of dollars locked in
+unreachable addresses every year. This is not a flaw of any one token standard; it is how
+push-based sending works everywhere. That is why this ERC covers native ETH and all major
+asset standards, not just one token interface.
 
-Several mitigations exist but none address the root cause at the token layer:
+Existing mitigations do not address the root cause:
 
-- **Smart wallets / address books** — useful, but they operate off-chain and protect only users
-  who have opted in to the specific wallet software.
-- **External escrow (e.g., this repo's `PendingTransfers.sol`)** — retrofits two-phase behavior
-  onto already-deployed tokens but adds friction (separate contract approval, two-step
-  interaction for every transfer).
-- **Multi-sig and social recovery** — solve key loss, not wrong-address loss.
+- **Smart wallets / address books**: operate off-chain and protect only opted-in users.
+- **Ad-hoc escrow contracts**: retrofit two-phase behavior but without a standard interface,
+  every wallet must integrate each escrow individually.
+- **Multi-sig and social recovery**: solve key loss, not wrong-address loss.
 
-A token-native two-phase interface solves the problem once, in the token itself, and lets
-wallets discover and render the pending-inbound state without any external contract.
+### The receiver should have a say
 
-### Receiver-acknowledgment asymmetry
+In a normal transfer, only the sender acts. The receiver does nothing, and a wrong address
+owns the funds the instant the transaction lands. Two-phase transfers flip this: the funds go
+into a pending state, and nothing settles until the named receiver signs an accept. Until they
+do, the sender can take the funds back. A stranger at a mistyped address never receives
+anything without acting for it.
 
-Plain ERC-20 has a fundamental asymmetry: the sender acts, the receiver is passive. If the
-receiver's address is wrong, the wrong party owns the funds with zero further action required.
-Two-phase transfers invert this: funds enter a pending state bound to `to`, and the receiver
-must actively sign an `acceptTransfer` transaction before settlement occurs. Until then, the
-sender can revoke. The wrong party at a mistyped address must actively accept — they cannot
-receive funds passively.
+### Why an optional second factor
 
----
+Requiring the receiver to accept already stops funds from landing on a wrong address by
+accident. But it does not stop one case: the wrong address belongs to someone active, they see
+the pending transfer, and they accept it before the sender notices the mistake.
+
+Committed mode closes this. The sender creates a secret and shares it with the intended
+receiver directly (chat, in person, a claim link), and only after the receiver has confirmed
+"yes, this is my address". Nobody can accept without the secret. An active stranger at a wrong
+address gets nothing.
 
 ## Specification
 
 The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT",
 "RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in
-RFC 2119.
+RFC 2119 and RFC 8174.
 
 ### Definitions
 
-- **Pending transfer** — a transfer that has been initiated but not yet accepted or revoked.
-- **Expiry** — an absolute Unix timestamp after which the receiver can no longer accept;
-  the sender MAY reclaim at or after expiry via `reclaimExpired`.
-- **Transfer ID** — a `uint256` uniquely identifying a pending transfer within a given token
-  contract.
+- **Pending transfer**: initiated but not yet accepted, revoked, or reclaimed.
+- **Expiry**: absolute Unix timestamp after which the receiver can no longer accept; the sender
+  MAY reclaim at or after expiry via `reclaimExpired`.
+- **Transfer ID**: a `uint256` uniquely identifying a pending transfer within an implementing
+  contract (escrow or token).
+- **Secret**: a throwaway secp256k1 private key, generated fresh per transfer by the sender and
+  delivered to the receiver out-of-band. It is used only to sign the accept digest and MUST never
+  appear on-chain.
+- **Commit**: the Ethereum address derived from the secret key. A commit of `address(0)` denotes
+  plain mode.
+- **Accept digest**: `keccak256(abi.encode(block.chainid, implementingContract, id, caller))`,
+  the message the secret key signs to authorize acceptance by `caller`.
 
-### IERC20TwoPhase
+### Deployment models
+
+The lifecycle MUST be implemented in one of two embodiments; both are conforming:
+
+1. **Standalone escrow (`ITwoPhaseEscrow`)**: a separate contract that takes custody of the
+   asset while pending. This is the universal retrofit path: it works for **native ETH** (sent
+   as `msg.value` at initiation) and **any deployed ERC-20, ERC-721, or ERC-1155** (pulled via
+   the asset's own approval + `transferFrom` mechanics). Assets are described by an `Asset`
+   struct (`kind`, `token`, `tokenId`, `amount`) so one contract and one wallet integration
+   cover every asset class.
+2. **Token-native extension (`IERC20TwoPhase` / `IERC721TwoPhase`)**: for newly deployed
+   tokens, the lifecycle lives inside the token: no external contract, no approval step, and
+   pending state is enforced by the token's own accounting (escrow-in-own-balance for ERC-20,
+   transfer lock for ERC-721). Discoverable via ERC-165.
+
+In short: the escrow works with everything but needs an approval step; the native extension is
+smoother but only exists on tokens that adopt it. Wallets SHOULD support both.
+
+### Common lifecycle rules (all embodiments, both modes)
+
+- `initiateTransfer` / `initiateTransferWithCommit` MUST bind the pending asset to exactly one
+  receiver `to` (non-zero, not the sender) and one expiry in
+  `[block.timestamp + MIN_EXPIRY, block.timestamp + MAX_EXPIRY]`; otherwise MUST revert.
+- While pending, the escrowed asset MUST NOT be movable by any function other than
+  `acceptTransfer`, `revokeTransfer`, or `reclaimExpired` for that transfer id.
+- `acceptTransfer` (either overload) MUST require `msg.sender == pending.to` and MUST revert if
+  the transfer is not pending. Implementations MAY additionally reject acceptance after expiry;
+  the reference implementation lets the sender's `revokeTransfer` / `reclaimExpired` be the
+  post-expiry authority instead.
+- `revokeTransfer` MUST require `msg.sender == pending.from` and MAY be called any time while
+  pending (including after expiry).
+- `reclaimExpired` MUST require `msg.sender == pending.from` AND `block.timestamp > expiry`.
+  It MUST NOT be callable by third parties (see Rationale).
+- In the token-native embodiment, the standard ERC-20 / ERC-721 `Transfer` event MUST be
+  emitted on acceptance so downstream indexers observe settlement identically to a plain
+  transfer. (In the escrow embodiment the underlying asset contract emits its own transfer
+  events as custody moves.)
+- Transfer ids MUST never be reused.
+
+### Committed-mode rules
+
+- `initiateTransferWithCommit` MUST revert if `commit == address(0)` (`BadCommit`).
+- The single-argument `acceptTransfer(id)` MUST revert with `SecretRequired` if the transfer
+  carries a non-zero commit.
+- `acceptTransfer(id, secretSig)` MUST perform the receiver check (`msg.sender == pending.to`,
+  reverting `NotReceiver`) **before** any signature verification, so a non-receiver caller
+  learns nothing about signature validity. It MUST then verify that `secretSig` is a valid ECDSA
+  signature over the accept digest `keccak256(abi.encode(block.chainid, address(this), id,
+  msg.sender))` recovering to `pending.commit`, reverting `BadSecret` otherwise (including on
+  malformed signatures and plain-mode transfers).
+- The raw secret key MUST NOT be a parameter of any function of this interface. Proof of the
+  secret is only ever a signature bound to `msg.sender`, so calldata (including calldata of
+  reverted transactions and mempool-visible transactions) never contains transferable secret
+  material.
+- Implementations SHOULD expose `acceptDigest(uint256 id, address caller) → bytes32` so clients
+  can construct the exact signing preimage without replicating the encoding.
+- Revocation and reclaim MUST NOT require the secret. The sender's key is always a sufficient
+  recovery path.
+
+### Assumptions (normative)
+
+Conforming implementations, wallets, and users operate under the following assumptions. They are
+part of the security contract of this ERC; violating them voids the protections the standard
+provides.
+
+1. **The secret never touches the chain.** The secret key is only ever used to sign, locally.
+   What goes into the transaction is the signature, and that signature names the account it
+   was made for. So even if someone submits an accept from the wrong account by mistake, the
+   leaked signature works for nobody: not for the submitter (wrong receiver), not for anyone
+   who copies it (wrong account named inside it). The secret key itself stays private. This is
+   enforced by design, not by asking wallets to be careful. A scheme that put the raw secret in
+   calldata would leak it the moment any transaction was broadcast, even one that reverts,
+   because calldata is public. If the receiver address turns out to be wrong or unowned, keep
+   the key private and just revoke or reclaim.
+2. **Both factors, always.** Settling a committed transfer takes the receiver's own key AND a
+   signature from the secret key. One without the other moves nothing. Front-running an accept
+   transaction is useless twice over: the attacker is not the receiver, and the signature they
+   copied does not verify for their account.
+3. **The secret travels off-chain, and only after the address is confirmed.** Chat, in person,
+   QR, claim link. The sender MUST NOT deliver the secret until the receiver has confirmed,
+   over that same channel, that the address is really theirs. Delivering the secret on the mere
+   assumption that `to` is correct hands both factors to whoever actually controls that
+   address: they can sign the accept, broadcast it, and once mined the funds are lost for good
+   (see Security Considerations). On-chain, only the derived address appears.
+4. **Fresh secret every time.** Secret keys MUST be randomly generated per transfer (full
+   256-bit entropy) and MUST NOT be reused across transfers or chains. Words and PINs are
+   forbidden as key material; anyone can grind guesses against the published commit address
+   off-chain.
+5. **Wrong address? Revoke.** When the sender discovers `to` is wrong or unclaimed, the ONLY
+   correct actions are `revokeTransfer` (any time while pending) or `reclaimExpired` (after
+   expiry). Wallets MUST steer users there and MUST NOT prompt for the secret key or sign with
+   it in that situation.
+6. **The sender still needs their key.** Revoke and reclaim require the sender's key. Lose it
+   while a transfer is pending and there is no recovery once the receiver window lapses.
+   Pending transfers are not a substitute for key custody.
+7. **Timestamps and finality.** Expiry uses `block.timestamp`. Validators can shift it by
+   seconds; `MIN_EXPIRY` is minutes, so it doesn't matter. A settled accept is assumed final;
+   this ERC does not defend against chain reorganizations.
+8. **Wallet duties.** Check ERC-165 before showing two-phase UX. Sign the accept digest
+   locally; never send the secret key to any service. Never log or store it unencrypted. Sign
+   for the account the user is actually accepting from. Show senders their pending outbound
+   transfers, so an unexpected acceptance race gets noticed and revoked.
+9. **The custodian is the contract.** While pending, the escrow or token contract holds the
+   asset. Users trust that it upholds the accounting invariant below and has no path that moves
+   escrowed assets outside accept / revoke / reclaim.
+
+### ITwoPhaseEscrow (standalone escrow: native ETH and any asset)
 
 ```solidity
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: CC0-1.0
 pragma solidity ^0.8.20;
 
-import {IERC165} from "@openzeppelin/contracts/utils/introspection/IERC165.sol";
+interface ITwoPhaseEscrow {
+    enum Status { None, Pending, Accepted, Revoked, Reclaimed }
+    enum AssetType { Native, ERC20, ERC721, ERC1155 }
 
-/// @title IERC20TwoPhase
-/// @notice Optional ERC-20 extension: two-phase (initiate → accept) transfers with
-///         sender-revocable pending state and bounded expiry.
-interface IERC20TwoPhase is IERC165 {
+    struct Asset {
+        AssetType kind;
+        address   token;   // asset contract; MUST be address(0) for Native
+        uint256   tokenId; // ERC-721 / ERC-1155 id; MUST be 0 otherwise
+        uint256   amount;  // wei / token units / ERC-1155 units; MUST be 1 for ERC-721
+    }
 
-    // -------------------------------------------------------------------------
-    // Events
-    // -------------------------------------------------------------------------
+    struct PendingTransfer {
+        address from;
+        address to;
+        Asset   asset;
+        uint64  expiry;
+        Status  status;
+        address commit;  // address of the secret key; address(0) => plain mode
+    }
 
-    /// @notice Emitted when a transfer is initiated and funds enter pending state.
-    /// @param transferId Unique id for this pending transfer within this token.
-    /// @param from       Initiating sender; funds debited from this balance.
-    /// @param to         Intended receiver; the only address that may accept.
-    /// @param amount     Token units locked in pending state.
-    /// @param expiry     Absolute Unix timestamp after which receiver cannot accept.
     event TransferInitiated(
-        uint256 indexed transferId,
+        uint256 indexed id,
+        address indexed from,
+        address indexed to,
+        Asset   asset,
+        uint64  expiry,
+        address commit
+    );
+    event TransferAccepted(uint256 indexed id);
+    event TransferRevoked(uint256 indexed id);
+    event TransferReclaimed(uint256 indexed id);
+
+    error BadExpiry();
+    error BadAmount();
+    error BadReceiver();
+    error BadAsset();             // asset fields inconsistent with kind
+    error NotReceiver();
+    error NotSender();
+    error NotPending();
+    error NotExpired();
+    error BadCommit();
+    error SecretRequired();
+    error BadSecret();
+    error NativeTransferFailed();
+
+    /// Escrow `asset` from the caller into a pending transfer bound to `to`.
+    /// Native: send the amount as msg.value. Tokens: approve the escrow first;
+    /// msg.value MUST be zero.
+    function initiateTransfer(Asset calldata asset, address to, uint64 expiry)
+        external payable returns (uint256 id);
+
+    function initiateTransferWithCommit(Asset calldata asset, address to, uint64 expiry, address commit)
+        external payable returns (uint256 id);
+
+    function acceptTransfer(uint256 id) external;
+    function acceptTransfer(uint256 id, bytes calldata secretSig) external;
+    function revokeTransfer(uint256 id) external;
+    function reclaimExpired(uint256 id) external;
+
+    function pendingTransfer(uint256 id) external view returns (PendingTransfer memory);
+    function acceptDigest(uint256 id, address caller) external view returns (bytes32);
+    function MIN_EXPIRY() external view returns (uint64);
+    function MAX_EXPIRY() external view returns (uint64);
+}
+```
+
+Escrow-specific rules:
+
+- The escrow MUST take full custody of the asset at initiation (native value via `msg.value ==
+  asset.amount`; tokens pulled via the asset contract's `transferFrom` / `safeTransferFrom`)
+  and MUST validate `Asset` field consistency per kind (`BadAsset` / `BadAmount` otherwise).
+- `msg.value` MUST be zero for non-native kinds, and MUST equal `asset.amount` for native, so
+  the escrow can never hold ETH that no transfer record owns. Implementations SHOULD NOT expose
+  a `receive()` / `fallback()` path for the same reason.
+- ERC-721 escrows MUST enforce `amount == 1`. ERC-1155 escrows MUST implement the
+  `onERC1155Received` hook to take custody.
+- All state-changing functions SHOULD be reentrancy-guarded: unlike the token-native
+  embodiment, settlement calls out to arbitrary asset contracts and (for native ETH) to the
+  recipient.
+- Fee-on-transfer or rebasing ERC-20s MAY cause the escrowed amount to differ from
+  `asset.amount`; handling such tokens is implementation-defined and senders SHOULD NOT use
+  the escrow with them.
+
+### IERC20TwoPhase (token-native extension)
+
+```solidity
+// SPDX-License-Identifier: CC0-1.0
+pragma solidity ^0.8.20;
+
+interface IERC20TwoPhase {
+    enum Status { None, Pending, Accepted, Revoked, Reclaimed }
+
+    struct PendingTransfer {
+        address from;
+        address to;
+        uint256 amount;
+        uint64  expiry;  // unix seconds
+        Status  status;
+        address commit;  // address of the secret key; address(0) => plain mode
+    }
+
+    /// commit is address(0) for plain-mode transfers; non-zero for committed ones.
+    event TransferInitiated(
+        uint256 indexed id,
         address indexed from,
         address indexed to,
         uint256 amount,
-        uint64  expiry
+        uint64  expiry,
+        address commit
     );
+    event TransferAccepted(uint256 indexed id);
+    event TransferRevoked(uint256 indexed id);
+    event TransferReclaimed(uint256 indexed id);
 
-    /// @notice Emitted when the receiver accepts a pending transfer and funds are credited.
-    /// @param transferId The id that was accepted.
-    event TransferAccepted(uint256 indexed transferId);
+    error BadExpiry();
+    error BadAmount();
+    error BadReceiver();
+    error NotReceiver();
+    error NotSender();
+    error NotPending();
+    error NotExpired();
+    error BadCommit();       // commit == address(0) on initiateTransferWithCommit
+    error SecretRequired();  // plain accept on a committed transfer
+    error BadSecret();       // signature doesn't recover to the committed address
 
-    /// @notice Emitted when the sender revokes a pending transfer and funds are returned.
-    /// @param transferId The id that was revoked.
-    event TransferRevoked(uint256 indexed transferId);
-
-    // -------------------------------------------------------------------------
-    // State-changing functions
-    // -------------------------------------------------------------------------
-
-    /// @notice Initiate a two-phase transfer. `amount` MUST be deducted from the
-    ///         caller's spendable balance immediately and held in pending state.
-    ///         The receiver's balance MUST NOT increase until `acceptTransfer` succeeds.
-    ///
-    /// @dev Callers MUST supply an expiry in [block.timestamp + MIN_EXPIRY,
-    ///      block.timestamp + MAX_EXPIRY]; the implementation MUST revert otherwise.
-    ///      Implementations SHOULD use a collision-resistant id derivation that includes
-    ///      at least (msg.sender, to, amount, per-sender-nonce, block.chainid) so that
-    ///      replays across chains and successive calls with identical parameters produce
-    ///      distinct ids.
-    ///
-    /// @param to      Intended receiver. MUST NOT be the zero address.
-    /// @param amount  Token units to lock. MUST be greater than zero.
-    /// @param expiry  Absolute Unix timestamp; receiver deadline.
-    /// @return transferId Unique identifier for the initiated pending transfer.
+    /// Escrow `amount` from the caller into a pending transfer bound to `to`.
+    /// Caller's spendable balance MUST decrease immediately; `to`'s MUST NOT
+    /// increase until acceptance.
     function initiateTransfer(address to, uint256 amount, uint64 expiry)
-        external
-        returns (uint256 transferId);
+        external returns (uint256 id);
 
-    /// @notice Accept a pending transfer. MUST be called by the pending receiver
-    ///         (`msg.sender == pending.to`). MUST revert if the transfer has expired,
-    ///         has already been accepted, or has been revoked. On success, the amount
-    ///         MUST be credited to the receiver and a standard ERC-20 `Transfer` event
-    ///         MUST be emitted.
-    ///
-    /// @param transferId The id returned by `initiateTransfer`.
-    function acceptTransfer(uint256 transferId) external;
+    /// Like initiateTransfer, but additionally commits to a throwaway secret key
+    /// (commit = its address). Settlement then requires the receiver's account key
+    /// AND a signature by the secret key.
+    function initiateTransferWithCommit(address to, uint256 amount, uint64 expiry, address commit)
+        external returns (uint256 id);
 
-    /// @notice Revoke a pending transfer, returning funds to the sender. MUST be called
-    ///         by the original sender (`msg.sender == pending.from`). MUST revert if the
-    ///         transfer has already been accepted or revoked. MAY be called at any time
-    ///         while the transfer is pending, including after expiry.
-    ///
-    /// @param transferId The id returned by `initiateTransfer`.
-    function revokeTransfer(uint256 transferId) external;
+    /// Bound receiver accepts a plain transfer. Reverts SecretRequired if committed.
+    function acceptTransfer(uint256 id) external;
 
-    /// @notice Reclaim an expired pending transfer, returning funds to the sender.
-    ///         MUST revert if the transfer has not yet expired, or if the transfer is
-    ///         not in the pending state. Implementations SHOULD restrict this to the
-    ///         original sender only (mirroring the "cancel is the sole recovery path"
-    ///         design of external escrow contracts) rather than allowing any caller,
-    ///         to prevent griefing by third parties settling transfers on behalf of
-    ///         senders who may still be deciding.
-    ///
-    /// @param transferId The id returned by `initiateTransfer`.
-    function reclaimExpired(uint256 transferId) external;
+    /// Bound receiver accepts a committed transfer by proving knowledge of the
+    /// secret key: secretSig is its ECDSA signature over
+    /// keccak256(abi.encode(block.chainid, address(this), id, msg.sender)).
+    /// Receiver check MUST run before signature verification.
+    function acceptTransfer(uint256 id, bytes calldata secretSig) external;
 
-    // -------------------------------------------------------------------------
-    // View functions
-    // -------------------------------------------------------------------------
+    /// The digest the secret key must sign for `caller` to accept transfer `id`.
+    function acceptDigest(uint256 id, address caller) external view returns (bytes32);
 
-    /// @notice Minimum expiry duration an implementation MUST enforce, in seconds
-    ///         relative to `block.timestamp` at initiation time. Implementations
-    ///         SHOULD set this to at least 600 (10 minutes) so that a genuine
-    ///         peer-to-peer hand-off is achievable without a race against the clock.
+    /// Sender revokes a still-pending transfer, refunding themselves.
+    function revokeTransfer(uint256 id) external;
+
+    /// Sender reclaims an unaccepted transfer after expiry.
+    function reclaimExpired(uint256 id) external;
+
+    function pendingTransfer(uint256 id) external view returns (PendingTransfer memory);
+
+    /// Bounds enforced on `expiry` relative to block.timestamp at initiation.
+    /// RECOMMENDED: MIN_EXPIRY >= 600 (10 minutes), MAX_EXPIRY <= 604800 (7 days).
     function MIN_EXPIRY() external view returns (uint64);
-
-    /// @notice Maximum expiry duration an implementation MUST enforce, in seconds
-    ///         relative to `block.timestamp` at initiation time. Implementations
-    ///         SHOULD set this to at most 604800 (7 days) to prevent accidental
-    ///         long-duration lockups from typos in the expiry field.
     function MAX_EXPIRY() external view returns (uint64);
-
-    /// @notice ERC-165 interface id for this extension.
-    ///         keccak256("IERC20TwoPhase") truncated to 4 bytes (to be computed at
-    ///         finalization time once all selectors are fixed).
-    // bytes4 public constant IERC20TWOPHASE_ID = 0xXXXXXXXX;
 }
 ```
 
-### IERC721TwoPhase
+### IERC721TwoPhase (token-native extension)
+
+Identical lifecycle keyed by `tokenId` instead of `amount`, with these additional rules:
 
 ```solidity
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: CC0-1.0
 pragma solidity ^0.8.20;
 
-import {IERC165} from "@openzeppelin/contracts/utils/introspection/IERC165.sol";
+interface IERC721TwoPhase {
+    enum Status { None, Pending, Accepted, Revoked, Reclaimed }
 
-/// @title IERC721TwoPhase
-/// @notice Optional ERC-721 extension: two-phase ownership transfer with
-///         sender-revocable pending state and bounded expiry.
-///
-/// @dev Ownership-lock model: while a tokenId is pending, the token contract
-///      MUST prevent any transfer of that token (sale, safeTransferFrom, approve-
-///      then-transfer, etc.). Recorded ownership SHOULD remain with the sender
-///      during the pending window so that marketplace metadata / ownership queries
-///      continue to resolve correctly. `acceptTransfer` performs the actual
-///      ownership move, at which point a standard ERC-721 `Transfer` event is emitted.
-interface IERC721TwoPhase is IERC165 {
+    struct PendingTransfer {
+        address from;
+        address to;
+        uint256 tokenId;
+        uint64  expiry;
+        Status  status;
+        address commit;
+    }
 
-    // -------------------------------------------------------------------------
-    // Events
-    // -------------------------------------------------------------------------
-
-    /// @notice Emitted when a token is locked into a pending two-phase transfer.
-    /// @param transferId Unique id for this pending transfer within this token contract.
-    /// @param from       Current owner / sender; token locked but ownership unchanged.
-    /// @param to         Intended receiver; only address that may accept.
-    /// @param tokenId    The locked token.
-    /// @param expiry     Absolute Unix timestamp after which receiver cannot accept.
     event TransferInitiated(
-        uint256 indexed transferId,
+        uint256 indexed id,
         address indexed from,
         address indexed to,
         uint256 tokenId,
-        uint64  expiry
+        uint64  expiry,
+        address commit
     );
+    event TransferAccepted(uint256 indexed id);
+    event TransferRevoked(uint256 indexed id);
+    event TransferReclaimed(uint256 indexed id);
 
-    /// @notice Emitted when the receiver accepts; ownership of `tokenId` moves to `to`.
-    /// @param transferId The id that was accepted.
-    event TransferAccepted(uint256 indexed transferId);
+    error BadExpiry();
+    error BadReceiver();
+    error NotOwner();
+    error NotReceiver();
+    error NotSender();
+    error NotPending();
+    error NotExpired();
+    error AlreadyPending();
+    error TokenLocked();
+    error BadCommit();
+    error SecretRequired();
+    error BadSecret();
 
-    /// @notice Emitted when the sender revokes; lock is released, ownership unchanged.
-    /// @param transferId The id that was revoked.
-    event TransferRevoked(uint256 indexed transferId);
-
-    // -------------------------------------------------------------------------
-    // State-changing functions
-    // -------------------------------------------------------------------------
-
-    /// @notice Initiate a two-phase ownership transfer. The token MUST be locked
-    ///         immediately (no further transfers or approvals of this tokenId until
-    ///         the pending transfer is resolved). Ownership record MUST remain with
-    ///         the sender during the pending window. A given tokenId MUST NOT have
-    ///         more than one simultaneous pending transfer; implementations MUST
-    ///         revert if the tokenId is already pending.
-    ///
-    /// @param to       Intended receiver. MUST NOT be the zero address.
-    /// @param tokenId  The token to transfer. Caller MUST be the owner or approved.
-    /// @param expiry   Absolute Unix timestamp; receiver deadline.
-    /// @return transferId Unique identifier for the initiated pending transfer.
     function initiateTransfer(address to, uint256 tokenId, uint64 expiry)
-        external
-        returns (uint256 transferId);
+        external returns (uint256 id);
+    function initiateTransferWithCommit(address to, uint256 tokenId, uint64 expiry, address commit)
+        external returns (uint256 id);
+    function acceptTransfer(uint256 id) external;
+    function acceptTransfer(uint256 id, bytes calldata secretSig) external;
+    function revokeTransfer(uint256 id) external;
+    function reclaimExpired(uint256 id) external;
 
-    /// @notice Accept a pending transfer. MUST be called by the pending receiver.
-    ///         MUST revert if expired, already accepted, or already revoked. On
-    ///         success, ownership of the tokenId MUST move to the receiver and a
-    ///         standard ERC-721 `Transfer` event MUST be emitted.
-    ///
-    /// @param transferId The id returned by `initiateTransfer`.
-    function acceptTransfer(uint256 transferId) external;
-
-    /// @notice Revoke a pending transfer. MUST be called by the original sender.
-    ///         Lock MUST be released; ownership remains with the sender. MUST revert
-    ///         if the transfer is not pending.
-    ///
-    /// @param transferId The id returned by `initiateTransfer`.
-    function revokeTransfer(uint256 transferId) external;
-
-    /// @notice Reclaim an expired pending transfer. Lock is released; ownership
-    ///         remains with the sender. MUST revert if the transfer has not expired
-    ///         or is not pending. SHOULD be restricted to the original sender only.
-    ///
-    /// @param transferId The id returned by `initiateTransfer`.
-    function reclaimExpired(uint256 transferId) external;
-
-    // -------------------------------------------------------------------------
-    // View functions
-    // -------------------------------------------------------------------------
-
-    /// @notice Returns true if `tokenId` is currently locked in a pending transfer.
-    function isPending(uint256 tokenId) external view returns (bool);
-
+    function pendingTransfer(uint256 id) external view returns (PendingTransfer memory);
+    function acceptDigest(uint256 id, address caller) external view returns (bytes32);
+    function isLocked(uint256 tokenId) external view returns (bool);
     function MIN_EXPIRY() external view returns (uint64);
     function MAX_EXPIRY() external view returns (uint64);
 }
 ```
 
-### Compatibility with base ERC-20 / ERC-721
+- While pending, recorded ownership MUST remain with the sender (`ownerOf` unchanged) and the
+  token MUST be locked: `transferFrom`, `safeTransferFrom`, and any other ownership-changing
+  path MUST revert (`TokenLocked`) until settled. `acceptTransfer` performs the actual move.
+- A `tokenId` MUST NOT have more than one simultaneous pending transfer (`AlreadyPending`).
 
-Implementations MUST preserve existing `transfer`, `transferFrom`, `safeTransferFrom` semantics.
-Plain transfers MUST remain atomic. The two-phase lifecycle is initiated only by explicit calls
-to `initiateTransfer`. This is the **opt-in per call** model; the alternative — routing every
-plain transfer through two-phase — would break every existing DeFi and marketplace integration
-and is explicitly NOT specified here (see Rationale).
+### Compatibility with base asset standards
+
+Token-native implementations MUST preserve existing `transfer`, `transferFrom`, and
+`safeTransferFrom` semantics for non-pending assets. The two-phase lifecycle is entered only by
+explicit calls to `initiateTransfer` / `initiateTransferWithCommit` (opt-in per call). Routing
+all plain transfers through two-phase is explicitly NOT specified (see Rationale). The escrow
+embodiment by construction changes nothing about the underlying assets; it is an ordinary
+holder from their perspective.
 
 ### ERC-165 detection
 
-Compliant implementations MUST return `true` for `supportsInterface(IERC20TWOPHASE_ID)` or
-`supportsInterface(IERC721TWOPHASE_ID)`. Wallets and dapps MUST use this check to decide
-whether to render the pending-inbound UI, rather than relying on bytecode inspection or
-off-chain registries.
-
----
+Token-native implementations MUST return `true` from `supportsInterface` for
+`type(IERC20TwoPhase).interfaceId` or `type(IERC721TwoPhase).interfaceId` respectively.
+Standalone escrows SHOULD support ERC-165 and return `true` for
+`type(ITwoPhaseEscrow).interfaceId`. Wallets and dapps MUST use these checks (not bytecode
+inspection or off-chain registries) to decide whether to render two-phase UX.
 
 ## Rationale
 
-### Is this worth an ERC? — Honest analysis
+### Is this worth an ERC?
 
-#### Arguments in favor
+**For:** money lost to wrong addresses is real, large, and permanent, and grows with adoption;
+giving the receiver a say fixes the one-sidedness of plain transfers; and a standard interface
+means wallets build the "you have a pending transfer" screen once, not once per escrow.
 
-1. **Quantifiable loss class.** Misdirected ERC-20 transfers are not theoretical. Billions of
-   dollars sit permanently in unreachable addresses. The loss is irreversible by design and
-   the frequency scales with the user base.
-2. **Receiver-acknowledgment closes a real gap.** Plain ERC-20 is sender-unilateral: the
-   receiver has no channel through which to refuse or acknowledge. Two-phase gives both parties
-   agency over settlement.
-3. **Uniform wallet UX.** Without a standard interface, every wallet that wants to surface
-   pending-inbound transfers must either integrate a specific escrow contract or invent its own
-   schema. A standard lets wallets query `supportsInterface` and render a canonical "you have a
-   pending incoming transfer — accept or wait for it to expire" experience.
+**Against:** DeFi assumes transfers settle instantly, and a two-phase asset in pending state
+doesn't (mitigated here: plain transfers stay untouched); the second transaction doubles gas and
+steps for the vast majority of transfers that were fine; wallet-level fixes (address books,
+smart wallets) already help; and earlier attempts like [ERC-1996](./erc-1996.md) (Holdable
+Token), [ERC-2020](./erc-2020.md) (E-Money Standard Token), and [ERC-5528](./erc-5528.md)
+(Refundable Token) never took off.
 
-#### Arguments against
+**Conclusion:** this standard earns its place as (1) a universal retrofit, where one escrow
+contract and one wallet integration cover ETH and every deployed token today, (2) an opt-in feature for
+new tokens built for person-to-person payments, and (3) a common wallet UX. It does not replace
+normal transfers anywhere.
 
-1. **Breaks the atomic-settlement assumption DeFi relies on.** AMMs, lending protocols, yield
-   aggregators — all assume that a `transfer` call either succeeds and moves funds, or reverts.
-   A token that can hold funds in pending limbo cannot serve as a pool asset in pending mode
-   without significant protocol redesign. The opt-in model specified here mitigates this
-   substantially (plain `transfer` remains atomic), but a two-phase-native token is still not
-   drop-in equivalent to a plain ERC-20 in every integration context.
-2. **Doubles gas and UX steps for the 99% of correct transfers.** For the common case —
-   sending to the right address — two-phase adds latency and a second transaction. This is a
-   meaningful regression for high-frequency use cases (payroll, payments, L2 bridges).
-3. **Application-layer alternatives are mature.** Smart wallet address books, ENS, named
-   transfer protocols, and external escrow contracts (see this repo's `PendingTransfers.sol`)
-   solve most of the misdirected-send problem without touching the token layer.
-4. **Prior art reached limited adoption.** Several related standards have been proposed and
-   none has seen meaningful deployment:
-   - **ERC-1996 (Holdable Token)** — defines a hold lifecycle with notary, expiry, and lockup,
-     targeting payment use cases; never formally finalized.
-   - **ERC-2020 (E-Money Standard Token)** — comprehensive payment token with holds, freezes,
-     and compliance hooks; complex and narrowly scoped to regulated e-money.
-   - **ERC-5528 (Refundable Token)** — buyer-refundable fungible tokens using escrow-like
-     accounting; different use case but similar two-phase intuition.
-   - **External escrow (this repo's `PendingTransfers`)** — the pragmatic, deployable alternative:
-     works with any already-deployed ERC-20 or native ETH, requires no token modification, and
-     provides an additional out-of-band secret factor for stronger protection. It is the only
-     retrofit path for tokens already in production.
+### Why two embodiments instead of one
 
-#### Honest conclusion
+An escrow-only standard would already cover every asset, including future ones, with no token
+cooperation needed. But the escrow flow costs an approval transaction and puts a third-party
+contract between the user and their funds; a token that builds the lifecycle in natively skips
+both. A native-only standard fails harder: it can never cover ETH or the tokens already
+deployed, which is where today's losses actually happen. So both embodiments stay, sharing one
+lifecycle, one commit model, and one set of assumptions; wallets only differ in where they read
+custody from.
 
-This extension is strongest as two things simultaneously:
+### Committed mode is optional, not mandatory
 
-1. **An opt-in extension for newly deployed tokens** where the issuer wants receiver-
-   acknowledgment semantics built into the token itself (e.g., payment stablecoins, corporate
-   treasury tokens, or any token primarily used for P2P value transfer rather than DeFi liquidity).
-2. **A wallet UX standard** — a common interface lets wallets detect two-phase-capable tokens
-   and render consistent pending-inbound UI without per-token integration work.
+Requiring the secret on every transfer was rejected. Between people who transact regularly, the
+receiver-accept step alone already prevents accidental mis-delivery, and forcing a secret
+exchange every time just doubles the friction. The sender chooses per transfer: plain mode for
+a known counterparty, committed mode for a new address or a large amount.
 
-For **existing tokens already deployed** at a fixed address, external escrow (exemplified by
-`contracts/src/PendingTransfers.sol` in this repo) remains the only viable retrofit path.
-`PendingTransfers` also provides a stronger security model — requiring both receiver key control
-*and* an off-chain secret — which is orthogonal to the simpler acceptance-acknowledgment model
-described in this ERC.
+### Signature proof instead of preimage reveal
 
-This extension is **not** a replacement for base ERC-20 semantics. Mandating two-phase for all
-transfers would break the ecosystem; the opt-in model specified here is the appropriate scope.
+The obvious design (store `keccak256(secret)`, have the receiver submit the raw reveal code)
+was rejected. It has a fatal flaw: the reveal code sits in calldata, and calldata is public the
+moment the transaction is broadcast. Every mempool watcher reads the
+reveal code out of the pending transaction BEFORE it is mined, and it stays public even if the
+transaction reverts. From that moment the code is not a secret anymore; the only thing standing
+between mempool observers and the funds is the receiver-binding check. A receiver who submits
+from the wrong account by mistake broadcasts the code to the whole network, gets nothing back
+(`NotReceiver`), and has burned the second factor. No on-chain check can prevent any of this:
+by the time the contract compares hashes, everyone has already seen the code.
 
-### Plain-transfer compatibility decision
+So instead: the secret is a throwaway private key, and the receiver proves they have it by
+signing. The signed message names the chain, the contract, the transfer id, and the caller's
+account, so a copied signature works nowhere else: not for another caller, another transfer,
+another contract, or another chain. Submit from the wrong account by mistake and all you leak
+is a signature for that wrong account, which is useless to everyone; the key stays private and
+still works for the real receiver. The price is one `ecrecover` (~3k gas) and a local signing
+step. For the user nothing changes: the secret is still a single 32-byte blob, same as
+claim-link protocols use in production today.
 
-Two options were considered for plain `transfer()`:
+One detail: the sender can't know the transfer id before the initiation is mined (ids are a
+counter), so the commit itself binds no transfer parameters. That's fine: the commit is stored
+inside the transfer record, and the id gets bound at accept time inside the signed message.
 
-- **(a) Stays atomic — opt-in per call (RECOMMENDED and SPECIFIED HERE).** The extension
-  adds new functions; existing functions are unchanged. DeFi composability is preserved.
-  Token issuers choose whether to expose two-phase for specific use cases.
-- **(b) Route all transfers through two-phase.** Breaks every AMM, lending protocol, and
-  bridge that calls `transfer`. This option is explicitly rejected.
+### `reclaimExpired` is sender-only
+
+Letting anyone push expired transfers back to the sender was rejected. It gives third parties a
+way to interfere with a sender who is still deciding what to do, and it adds nothing, since the
+sender can always reclaim themselves.
 
 ### ERC-721 lock model
 
-Two ownership models during a pending ERC-721 transfer were considered:
+Moving custody to the contract while pending (making `ownerOf` return the contract) breaks
+marketplace metadata and ownership queries. Instead, ownership stays with the sender and the
+token is locked; implementations SHOULD enforce the lock in the internal transfer hook (e.g.,
+OpenZeppelin v5's `_update`).
 
-- **Transfer custody to the contract.** `ownerOf(tokenId)` returns the contract address while
-  pending. Breaks marketplace metadata queries (rarity tools, OpenSea, etc.) that assume the
-  owner is a human-controlled address.
-- **Keep ownership with sender, set a lock (RECOMMENDED and SPECIFIED HERE).** `ownerOf`
-  continues to return the sender; any call to `transferFrom`, `safeTransferFrom`, or `approve`
-  on the locked token MUST revert. `acceptTransfer` performs the actual ownership move.
-  Implementations SHOULD override `_update` (OZ ERC721 v5) or the equivalent internal hook to
-  enforce the lock.
+### Expiry bounds
 
-The lock model is preferred because it preserves existing marketplace and explorer UX for
-tokens that have not yet been accepted.
-
-### Expiry bounds (MIN_EXPIRY / MAX_EXPIRY)
-
-Expiry is bounded rather than left open-ended for two reasons:
-
-- **Lower bound (RECOMMENDED: 600 seconds / 10 minutes).** A genuine peer-to-peer hand-off
-  — communicating the transfer out-of-band, reading the receiver code, typing an acceptance
-  transaction — must be achievable without a time-pressure race. 10 minutes provides a
-  comfortable window. The sender retains the ability to revoke at any time during this window,
-  so the lower bound does not materially reduce sender flexibility; it is purely a receiver
-  guarantee.
-- **Upper bound (RECOMMENDED: 604800 seconds / 7 days).** Prevents accidental decade-long
-  lockups caused by a typo in the expiry field (e.g., passing a timestamp in milliseconds
-  rather than seconds). 7 days is long enough for any reasonable acknowledgment workflow
-  including slow cross-timezone communication.
-
-These values are drawn from the reference implementation (`PendingTransfers.sol:63-67`) where
-they have been validated in production on Base.
-
----
+- **Lower bound (RECOMMENDED 10 minutes):** a genuine hand-off (communicating out-of-band,
+  entering the acceptance) must not race the clock. The sender can revoke throughout, so this
+  is purely a receiver guarantee.
+- **Upper bound (RECOMMENDED 7 days):** prevents accidental long lockups from expiry-field
+  typos (e.g., milliseconds passed as seconds) while allowing slow cross-timezone workflows.
 
 ## Backwards Compatibility
 
-This ERC introduces new functions and events on top of ERC-20 and ERC-721. It does not modify
-any existing function signatures, return types, or event semantics. Existing contracts,
-aggregators, DEXs, and marketplaces that call only the base ERC-20 or ERC-721 interface are
-unaffected.
-
-Tokens that implement this extension SHOULD announce it via ERC-165 so that integrators can
-detect two-phase capability without any source-code inspection.
-
----
+The escrow embodiment is a new standalone contract and touches no existing standard. The
+token-native embodiment only adds functions, events, and errors on top of ERC-20 / ERC-721; no
+existing signature, return type, or event changes. Contracts, aggregators, DEXs, and
+marketplaces calling only the base interfaces are unaffected. Note that ERC-20 implementations
+using the escrow-in-own-balance pattern will show pending amounts in `balanceOf(token)`, which
+analytics treating the token's own address as anomalous should account for.
 
 ## Security Considerations
 
-### Why this works — no loophole for an accidental third party to take the funds
+### No loophole for an accidental third party
 
-The design provides genuine two-factor protection. Each factor independently excludes an
-accidental third-party recipient:
+Each factor on its own is enough to stop an accidental recipient:
 
-**Factor 1 — receiver's private key.** Funds never sit at a bare address after initiation; they
-are held in the token's internal pending state, bound to `to`. Settlement requires
-`msg.sender == pending.to`, meaning a signed transaction from that exact key. A stranger at a
-mistyped address can only receive if they *actively sign an acceptTransfer transaction* — funds
-cannot land on them passively. Until someone accepts, the sender can revoke. This is a
-structural improvement over plain ERC-20, where the mistyped address owns funds *instantly*
-with no further action required.
-
-**Factor 2 — the acceptance window as a confirmation channel.** Even if the wrong address
-belongs to an active wallet that notices the pending transfer and tries to accept it, the sender
-can revoke before any accept is mined, especially since the pending state is visible on-chain
-and wallets implementing this standard will surface it to the sender. For implementations that
-add an additional out-of-band secret (as in `PendingTransfers.sol`), the receiver must *also*
-hold the secret, providing a second independent exclusion.
-
-**Why there is no bypass path:**
-
-- The contract holds custody while pending, so no other function can move the funds.
-- Transfer IDs are collision-resistant (implementors SHOULD include sender nonce and `chainid`
-  in the derivation preimage, so there are no replays across chains or successive identical
-  calls).
-- CEI (Checks-Effects-Interactions) ordering and `ReentrancyGuard` rule out drain-via-reentry.
-- After expiry, the only recovery path is `reclaimExpired` back to the sender.
+- **Receiver key.** After initiation the funds sit in the contract, not at the target address.
+  Settling takes a transaction signed by exactly the named receiver. A stranger at a mistyped
+  address gets nothing unless they actively accept, and until anyone accepts, the sender can
+  revoke.
+- **Secret key (committed mode).** Even a stranger who races to accept fails without the
+  secret. And the secret can't be picked up from the chain: the mempool only ever shows
+  signatures, each one locked to a specific account (Assumption 1). Watch a valid accept: the
+  signature only works for the real receiver. Watch a botched accept from a wrong account: the
+  signature only works for that wrong account, where the receiver check rejects it. Nothing
+  observed on-chain can be reused by anyone.
+- **No bypass path.** The contract holds custody while pending, ids are never reused, and after
+  expiry the only path is back to the sender. Reentrancy can't drain it: the token-native
+  embodiment makes no external calls during settlement at all, and the escrow embodiment (which
+  does call out to asset contracts and ETH recipients) is reentrancy-guarded with state
+  finalized before any external call.
 
 ### Explicit out-of-scope: social engineering
 
-This extension protects against *mistaken* sends (typos, wrong paste, clipboard poisoning,
-receiver unaware of funds). It does **not** protect against social engineering — a scenario
-where the victim is deliberately deceived into naming a malicious address as receiver, AND
-subsequently signs the `acceptTransfer` transaction because they were convinced to do so. In
-that case, both factors are willingly provided by the victim to the attacker. This threat model
-is explicitly out of scope; wallets and dapps SHOULD include appropriate warnings, but the
-token contract cannot prevent a user who has been socially engineered.
+This ERC protects against *mistakes*. It does not protect someone who is tricked into naming
+the attacker's address as the receiver and then handing them the secret too; at that point the
+victim has given away both factors voluntarily. Wallets SHOULD warn; no contract can prevent
+it.
+
+### Secret-handling failure modes
+
+- **On-chain leaks: designed out.** Transactions only ever carry account-bound signatures, so
+  no transaction, mined or reverted, can expose the secret key. Accepting from the wrong
+  account by mistake, the failure that kills raw-secret schemes, leaks nothing usable here (see
+  Rationale).
+- **What mempool watchers actually see.** The moment the receiver broadcasts an
+  accept, every mempool observer sees the full calldata: the transfer id and the 65-byte
+  signature. That is a signature BY the secret key, not the secret key itself. Nobody can
+  compute a private key from one ECDSA signature (that is the discrete-log problem; if they
+  could, every signed Ethereum transaction would leak its account key). Nobody can replay the
+  signature either: the signed digest contains the broadcaster's account, so submitted from
+  any other address it fails verification, and the receiver check rejects the caller first
+  anyway. And nobody can redirect the payout, because the destination is read from the stored
+  transfer record, not from calldata. A builder with a full view of the mempool can delay or
+  censor the accept, but cannot take the funds. One cryptographic caveat: two signatures from
+  the same secret key with a repeated nonce would expose the key. This cannot arise when
+  secrets are single-use (Assumption 4, one signature ever exists per key) and clients sign
+  with deterministic nonces (RFC 6979), which standard libraries do.
+- **Off-chain leaks: still possible.** The key can leak through the chat it was sent over, a
+  compromised device, or a counterparty who wasn't who they claimed. As long as the leak goes
+  to someone who is NOT the bound receiver, the funds stay safe (the receiver check still
+  holds), but the second factor is gone. On any suspected leak, the sender SHOULD revoke and
+  re-initiate with a fresh key.
+- **Wrong address plus revealed secret: funds are lost.** This is the one way to lose funds
+  under this standard. The sender assumes `to` is correct, skips the confirmation step
+  (Assumption 3), and delivers the secret. Whoever actually controls that address now holds
+  BOTH factors: they are the bound receiver, and they have the secret key. They sign the
+  accept digest with it and broadcast the accept transaction from the receiver address. That
+  transaction now sits in the public mempool, carrying the receiver address as its sender and
+  the signature proving the secret in its calldata, and it passes every contract check,
+  because to the contract this IS the legitimate receiver accepting with the correct secret.
+  The sender sees it in the mempool only after it is already broadcast; the only counter is to
+  race it with a revoke and hope theirs is mined first. Once the accept is mined, settlement
+  is final and irreversible. Both protections were defeated by the same wrong assumption
+  before anything touched the chain, and no contract can detect it. This is exactly why
+  Assumption 3 makes address confirmation come BEFORE secret delivery, and why wallets MUST
+  NOT release the secret until the receiver has confirmed the address over the same channel.
+- **Weak secrets are crackable.** A word or PIN as key material can be brute-forced off-chain
+  against the published commit address (Assumption 4). Always random, always 256-bit.
+- **Plaintext storage spreads the risk.** A wallet that logs or cloud-syncs secret keys extends
+  the attack surface to the user's backups (Assumption 8).
 
 ### Griefing via dust pending-spam
 
-An attacker can initiate many small pending transfers to a victim address, potentially creating
-UI noise or consuming storage gas for the receiver. Mitigations:
+An attacker can initiate many small pending transfers to a victim to create UI noise. Pending
+state costs the attacker gas and locked capital, self-expires within `MAX_EXPIRY`, and wallets
+SHOULD let users hide sub-threshold pending inbounds.
 
-- Implementations SHOULD charge at least enough gas to make large-scale spam economically
-  unattractive.
-- Wallets rendering pending-inbound UI SHOULD allow users to ignore or hide transfers below a
-  threshold amount.
-- The bounded expiry guarantees that spam transfers self-expire within `MAX_EXPIRY`.
+### Accounting invariants
 
-### Accounting invariant
-
-Implementations MUST maintain the following invariant at all times:
+Token-native ERC-20 implementations MUST maintain, at all times:
 
 ```
-totalSupply() == sum(all balances) + sum(all pending transfer amounts)
+totalSupply() == sum(all balances) + sum(all pending amounts)
 ```
 
-Funds in pending state MUST be excluded from the sender's `balanceOf` return value and MUST NOT
-be included in the receiver's `balanceOf` until `acceptTransfer` succeeds. Violating this
-invariant would allow a sender to double-spend by initiating a transfer and then using the same
-funds in a plain transfer or DeFi interaction.
+Pending amounts MUST be excluded from the sender's spendable `balanceOf` and MUST NOT appear in
+the receiver's until acceptance; otherwise a sender could double-spend escrowed funds. The
+reference implementation satisfies the invariant by construction, escrowing pending amounts in
+the token contract's own balance.
 
-### Front-running
+Escrow implementations MUST maintain the analogous invariant per asset: the escrow's holdings
+of each asset equal the sum of that asset's pending amounts (for native ETH,
+`address(escrow).balance == sum(pending native amounts)`, hence the rule that ETH may enter
+only through initiation). Fee-on-transfer and rebasing ERC-20s violate this invariant by
+construction and are out of scope (see escrow-specific rules).
 
-An attacker who observes an `acceptTransfer` transaction in the mempool cannot front-run it to
-steal the funds: they are not the bound receiver, so the contract will reject their `accept`
-call. For implementations with an additional out-of-band secret (see `PendingTransfers.sol`),
-knowing the secret from the mempool is also insufficient because they must *also* be the bound
-receiver — knowledge of one factor alone provides no benefit.
+### Escrow-specific risks
 
-### Expiry and block-timestamp manipulation
+- **Asset-contract callbacks.** ERC-1155 (and safe ERC-721) transfers invoke recipient hooks;
+  malicious or reentrant asset contracts are the reason escrow settlement MUST be
+  reentrancy-guarded and state finalized before any external call.
+- **Non-paying native recipients.** A receiver or sender that is a contract rejecting ETH will
+  make its own payout revert (`NativeTransferFailed`); funds stay escrowed and the counterparty
+  path (revoke / reclaim, or accept) remains available. Senders SHOULD NOT initiate native
+  transfers from contracts that cannot receive ETH back.
+- **Escrow as honeypot.** A shared escrow pools everyone's pending value in one contract, which
+  makes that one contract a bigger target. Audit it accordingly. The reference implementation
+  keeps the attack surface small on purpose: no owner, no upgradability, no fee logic.
 
-Implementations rely on `block.timestamp` for expiry enforcement. Miners / validators can
-manipulate timestamps within a bounded range (typically ~15 seconds on Ethereum mainnet).
-Given that `MIN_EXPIRY` is recommended at 10 minutes, short-range timestamp manipulation
-cannot be exploited to deny a legitimate accept call.
+### Timestamp manipulation
 
----
+Validator timestamp drift (~seconds) is negligible against the minute-scale `MIN_EXPIRY`
+(Assumption 7) and cannot be used to deny a legitimate acceptance window.
 
 ## Reference Implementation
 
-Reference Solidity implementations are located at:
+Reference implementations and a full Foundry test suite are provided in
+[`../assets/erc-tbd/`](../assets/erc-tbd/):
 
-- `contracts/src/extensions/IERC20TwoPhase.sol` — interface with full NatSpec
-- `contracts/src/extensions/ERC20TwoPhase.sol` — abstract extension over OpenZeppelin `ERC20`
-- `contracts/src/extensions/IERC721TwoPhase.sol` — interface with full NatSpec
-- `contracts/src/extensions/ERC721TwoPhase.sol` — abstract extension over OpenZeppelin `ERC721`,
-  using `_update` override to enforce the token lock
-- `contracts/src/mocks/TwoPhaseToken.sol` — concrete mintable ERC-20 mock for tests
-- `contracts/src/mocks/TwoPhaseNFT.sol` — concrete mintable ERC-721 mock for tests
-
-Tests are in `contracts/test/ERC20TwoPhase.t.sol` and `contracts/test/ERC721TwoPhase.t.sol`.
-
-The external escrow reference implementation — which adds a second factor (off-chain secret)
-and works with any already-deployed ERC-20 — is at `contracts/src/PendingTransfers.sol`.
-
----
+- `TwoPhaseEscrow.sol` (with `ITwoPhaseEscrow.sol`): standalone escrow embodiment for native
+  ETH and any ERC-20 / ERC-721 / ERC-1155; reentrancy-guarded, no owner, no upgradability.
+- `ERC20TwoPhase.sol` / `ERC721TwoPhase.sol` (with their interfaces): token-native extensions;
+  escrow-in-own-balance model for ERC-20, `_update`-enforced lock model for ERC-721.
+- Tests. Every suite includes the two key negative tests: a valid signature replayed by a
+  different caller reverts, and a signature mistakenly produced for the wrong account is
+  unusable by everyone including the bound receiver. Together they show that no on-chain
+  observation ever yields transferable secret material.
 
 ## Copyright
 
-Copyright and related rights waived via [CC0](https://creativecommons.org/publicdomain/zero/1.0/).
+Copyright and related rights waived via [CC0](../LICENSE.md).
